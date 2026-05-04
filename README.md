@@ -113,3 +113,5 @@ A comprehensive real-time election results monitoring application for the Tamil 
 
 # Run the launcher (auto-installs all dependencies)
 python launch_app.py
+
+https://github.com/kirubanandem/TN26ElectionResults
