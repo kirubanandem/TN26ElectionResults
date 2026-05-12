@@ -6,6 +6,8 @@ TN Election 2026 – Live Results Monitor  (Enhanced)
 • Close Contests, Notable, Party-wise — all searchable
 • All Participants tab with candidate photos (SQLite cache)
 • PDF Export with photos and Won row highlighting
+• Offline Mode: Load from saved JSON files
+• Startup mode selection (asks user which mode to use)
 • Photo cache: candidateswise-S22{1-234}.htm → tn_election_photos.db
 Build EXE: pyinstaller --onefile --windowed tn_election_monitor.py
 """
@@ -24,6 +26,8 @@ import math
 import sqlite3
 import hashlib
 import io
+import json
+from collections import Counter
 
 try:
     from PIL import Image as PILImage, ImageTk
@@ -149,6 +153,7 @@ CONSTWISE_TEMPLATE  = "https://results.eci.gov.in/ResultAcGenMay2026/Constituenc
 CANDWISE_TEMPLATE   = "https://results.eci.gov.in/ResultAcGenMay2026/candidateswise-S22{}.htm"
 PHOTO_BASE_URL      = "https://results.eci.gov.in/ResultAcGenMay2026/"
 DB_PATH             = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tn_election_photos.db")
+CONFIG_FILE         = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_config.json")
 
 
 # ── Photo Cache (SQLite) ──────────────────────────────────────────────────────
@@ -670,7 +675,6 @@ def scrape_all():
         for f in concurrent.futures.as_completed(futures):
             pass
 
-    from collections import Counter
     trail_cnt = Counter(r.get("trail_short", "—") for r in all_rows.values())
     for abbr, cnt in trail_cnt.items():
         if abbr in eci_party:
@@ -708,7 +712,8 @@ class TNElectionApp:
         self.last_updated: str = ""
         self.auto_refresh = tk.BooleanVar(value=True)
         self.refresh_interval = tk.IntVar(value=60)
-        self.status_var = tk.StringVar(value="Ready. Click 'Refresh Now' to load data.")
+        self.status_var = tk.StringVar(value="Ready. Select mode to load data.")
+        self.offline_mode = tk.BooleanVar(value=False)
 
         self.search_var = tk.StringVar()
         self.close_search_var = tk.StringVar()
@@ -745,7 +750,80 @@ class TNElectionApp:
         self.eci_party = {}
 
         self._build_ui()
-        self.root.after(500, self.refresh_data)
+        
+        # Check for existing JSON data and offer offline mode
+        self.root.after(500, self._check_offline_data_on_startup)
+    
+    def _save_mode_preference(self):
+        """Save the user's mode preference to a config file"""
+        try:
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump({"offline_mode": self.offline_mode.get()}, f)
+        except:
+            pass
+    
+    def _load_mode_preference(self):
+        """Load saved mode preference"""
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                config = json.load(f)
+                return config.get("offline_mode", False)
+        except:
+            return False
+    
+    def _check_offline_data_on_startup(self):
+        """Check if offline data exists and ask user which mode to use"""
+        # Check if JSON files exist
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        json_locations = [
+            os.path.join(script_dir, "election_data", "election_data_compact.json"),
+            os.path.join(script_dir, "election_data_compact.json"),
+            "election_data_compact.json",
+        ]
+        
+        json_exists = any(os.path.exists(loc) for loc in json_locations)
+        
+        # Load saved preference
+        saved_preference = self._load_mode_preference()
+        
+        if json_exists:
+            # If user previously chose offline mode, use it without asking
+            if saved_preference:
+                self.offline_mode.set(True)
+                if hasattr(self, "offline_toggle"):
+                    self.offline_toggle.select()
+                self.refresh_data_offline()
+            else:
+                # Ask user which mode to use
+                result = messagebox.askyesno(
+                    "Choose Data Source",
+                    "Offline data (JSON) found!\n\n"
+                    "Do you want to use OFFLINE mode?\n"
+                    "• YES - Load from saved JSON (faster, no internet needed)\n"
+                    "• NO - Fetch live data from ECI website\n\n"
+                    "You can switch modes anytime using the checkbox in toolbar.\n"
+                    "Your preference will be saved for next launch."
+                )
+                
+                if result:
+                    # User wants offline mode
+                    self.offline_mode.set(True)
+                    if hasattr(self, "offline_toggle"):
+                        self.offline_toggle.select()
+                    self.refresh_data_offline()
+                else:
+                    # User wants live mode
+                    self.offline_mode.set(False)
+                    if hasattr(self, "offline_toggle"):
+                        self.offline_toggle.deselect()
+                    self.refresh_data()
+                
+                # Save preference
+                self._save_mode_preference()
+        else:
+            # No JSON found, use live mode
+            self.status_var.set("No offline data found. Fetching live data from ECI...")
+            self.refresh_data()
 
     def _build_ui(self):
         hdr = tk.Frame(self.root, bg="#1e3a5f", pady=8)
@@ -756,40 +834,61 @@ class TNElectionApp:
                                    bg="#1e3a5f", fg="#93c5fd", font=("Segoe UI", 9))
         self.status_lbl.pack(side="right", padx=16)
 
-        toolbar = tk.Frame(self.root, bg="#f1f5f9", pady=6, padx=10, relief="flat", bd=0)
-        toolbar.pack(fill="x")
+        self.toolbar = tk.Frame(self.root, bg="#f1f5f9", pady=6, padx=10, relief="flat", bd=0)
+        self.toolbar.pack(fill="x")
 
-        tk.Button(toolbar, text="⟳  Refresh Now", command=self.refresh_data,
+        tk.Button(self.toolbar, text="⟳  Refresh Now", command=self.refresh_data,
                   bg="#2563eb", fg="white", relief="flat", padx=12, pady=4,
                   font=("Segoe UI", 9, "bold"), cursor="hand2",
                   activebackground="#1d4ed8").pack(side="left", padx=(0, 8))
 
-        tk.Label(toolbar, text="Auto-refresh:", bg="#f1f5f9", font=("Segoe UI", 9)).pack(side="left")
-        tk.Checkbutton(toolbar, variable=self.auto_refresh, bg="#f1f5f9",
+        tk.Label(self.toolbar, text="Auto-refresh:", bg="#f1f5f9", font=("Segoe UI", 9)).pack(side="left")
+        tk.Checkbutton(self.toolbar, variable=self.auto_refresh, bg="#f1f5f9",
                        command=self._schedule_refresh).pack(side="left")
 
-        tk.Label(toolbar, text="Every:", bg="#f1f5f9", font=("Segoe UI", 9)).pack(side="left", padx=(4, 2))
-        iv_cb = ttk.Combobox(toolbar, textvariable=self.refresh_interval,
+        tk.Label(self.toolbar, text="Every:", bg="#f1f5f9", font=("Segoe UI", 9)).pack(side="left", padx=(4, 2))
+        iv_cb = ttk.Combobox(self.toolbar, textvariable=self.refresh_interval,
                              values=REFRESH_INTERVALS, width=5, state="readonly")
         iv_cb.pack(side="left")
-        tk.Label(toolbar, text="sec", bg="#f1f5f9", font=("Segoe UI", 9)).pack(side="left", padx=(2, 16))
+        tk.Label(self.toolbar, text="sec", bg="#f1f5f9", font=("Segoe UI", 9)).pack(side="left", padx=(2, 16))
+
+        # Offline mode toggle
+        self.offline_toggle = tk.Checkbutton(
+            self.toolbar, 
+            text="📁 Offline Mode (Use JSON)", 
+            variable=self.offline_mode,
+            bg="#f1f5f9",
+            font=("Segoe UI", 9),
+            command=self.toggle_offline_mode
+        )
+        self.offline_toggle.pack(side="left", padx=(16, 8))
+        
+        # Status indicator for current mode
+        self.offline_status_lbl = tk.Label(
+            self.toolbar, 
+            text="", 
+            bg="#f1f5f9", 
+            font=("Segoe UI", 8, "bold"),
+            width=12
+        )
+        self.offline_status_lbl.pack(side="left", padx=(5, 0))
 
         self.progress = ttk.Progressbar(self.root, mode="indeterminate", length=200)
 
-        tk.Button(toolbar, text="📄  Export PDF", command=self._export_pdf_current_tab,
+        tk.Button(self.toolbar, text="📄  Export PDF", command=self._export_pdf_current_tab,
                   bg="#059669", fg="white", relief="flat", padx=12, pady=4,
                   font=("Segoe UI", 9, "bold"), cursor="hand2",
                   activebackground="#047857").pack(side="right", padx=(8, 4))
 
         self._photo_btn = tk.Button(
-            toolbar, text="📷  Fetch Photos", command=self._start_photo_fetch,
+            self.toolbar, text="📷  Fetch Photos", command=self._start_photo_fetch,
             bg="#7c3aed", fg="white", relief="flat", padx=12, pady=4,
             font=("Segoe UI", 9, "bold"), cursor="hand2",
             activebackground="#6d28d9")
         self._photo_btn.pack(side="right", padx=(0, 4))
 
         self._photo_status_lbl = tk.Label(
-            toolbar, textvariable=self._photo_status_var,
+            self.toolbar, textvariable=self._photo_status_var,
             bg="#f1f5f9", fg="#7c3aed", font=("Segoe UI", 8))
         self._photo_status_lbl.pack(side="right", padx=(0, 8))
 
@@ -825,6 +924,187 @@ class TNElectionApp:
         self._build_close_tab()
         self._build_notable_tab()
         self._build_participants_tab()
+
+    def toggle_offline_mode(self):
+        """Toggle between live and offline mode."""
+        if self._loading:
+            return
+        
+        if self.offline_mode.get():
+            self.refresh_data_offline()
+        else:
+            self.refresh_data()
+        
+        # Save preference
+        self._save_mode_preference()
+
+    def load_from_json(self, json_file_path=None):
+        """Load election data from JSON file instead of live scraping."""
+        if json_file_path is None:
+            # Look for JSON files in default location
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            json_locations = [
+                os.path.join(script_dir, "election_data", "election_data_compact.json"),
+                os.path.join(script_dir, "election_data_compact.json"),
+                os.path.join(script_dir, "election_data", "complete_election_data.json"),
+                "election_data_compact.json",
+                "election_data/complete_election_data.json",
+            ]
+            
+            json_file = None
+            for loc in json_locations:
+                if os.path.exists(loc):
+                    json_file = loc
+                    break
+            
+            if json_file is None:
+                return False
+        
+        try:
+            with open(json_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            # Convert JSON data to the format expected by the application
+            constituencies = []
+            
+            for const in data.get("constituencies", []):
+                # Find trailing candidate (2nd place)
+                candidates = const.get("candidates", [])
+                sorted_candidates = sorted(candidates, key=lambda x: x.get("total_votes", 0), reverse=True)
+                
+                trail_cand = sorted_candidates[1] if len(sorted_candidates) > 1 else None
+                
+                constituency_data = {
+                    "no": const.get("no"),
+                    "constituency": const.get("constituency"),
+                    "lead_cand": const.get("lead_cand"),
+                    "lead_party": const.get("lead_party"),
+                    "lead_short": const.get("lead_short"),
+                    "trail_cand": trail_cand.get("name") if trail_cand else "",
+                    "trail_party": trail_cand.get("party") if trail_cand else "",
+                    "trail_short": trail_cand.get("party_short") if trail_cand else "—",
+                    "total_votes": const.get("total_votes", 0),
+                    "margin": const.get("margin", 0),
+                    "round": const.get("round", ""),
+                    "status": const.get("status", ""),
+                }
+                constituencies.append(constituency_data)
+            
+            # Get party totals
+            eci_party = {}
+            for abbr, info in data.get("party_totals", {}).items():
+                eci_party[abbr] = {
+                    "abbr": abbr,
+                    "full": info.get("full", abbr),
+                    "won": info.get("won", 0),
+                    "leading": info.get("leading", 0),
+                    "total": info.get("total", 0),
+                    "trailing": 0,
+                    "color": info.get("color", "#6b7280")
+                }
+            
+            # Calculate trailing counts
+            trail_cnt = Counter(c.get("trail_short", "—") for c in constituencies)
+            for abbr, cnt in trail_cnt.items():
+                if abbr in eci_party:
+                    eci_party[abbr]["trailing"] = cnt
+            
+            # Store participants data if available
+            participants_data = []
+            for const in data.get("constituencies", []):
+                for candidate in const.get("candidates", []):
+                    participants_data.append({
+                        "no": const.get("no"),
+                        "constituency": const.get("constituency"),
+                        "candidate": candidate.get("name"),
+                        "party": candidate.get("party"),
+                        "party_short": candidate.get("party_short"),
+                        "evm_votes": candidate.get("evm_votes", 0),
+                        "postal_votes": candidate.get("postal_votes", 0),
+                        "total_votes": candidate.get("total_votes", 0),
+                        "vote_pct": candidate.get("vote_percentage", ""),
+                        "rank": 0,
+                        "result": "",
+                    })
+            
+            # Calculate ranks and results for participants
+            for const_no in set(p["no"] for p in participants_data):
+                const_candidates = [p for p in participants_data if p["no"] == const_no]
+                sorted_cands = sorted(const_candidates, key=lambda x: x["total_votes"], reverse=True)
+                for rank, cand in enumerate(sorted_cands, 1):
+                    cand["rank"] = rank
+                    if rank == 1:
+                        const_data = next((c for c in constituencies if c["no"] == const_no), {})
+                        cand["result"] = "Won" if const_data.get("status") == "Won" else "Leading"
+                    else:
+                        cand["result"] = "Trailing"
+            
+            self.data = constituencies
+            self.eci_party = eci_party
+            self._participants_data = participants_data
+            self.last_updated = data.get("metadata", {}).get("last_updated", "From saved data")
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error loading JSON: {e}")
+            return False
+
+    def refresh_data_offline(self):
+        """Load data from JSON file instead of live scraping."""
+        if self._loading:
+            return
+        
+        # Cancel any scheduled refresh jobs
+        if self._refresh_job:
+            self.root.after_cancel(self._refresh_job)
+            self._refresh_job = None
+        
+        self._loading = True
+        self.status_var.set("📁 Loading data from saved JSON file...")
+        self.progress.pack(fill="x", padx=8, pady=2)
+        self.progress.start(10)
+        
+        def _load_thread():
+            success = self.load_from_json()
+            self.root.after(0, self._on_offline_data_ready, success)
+        
+        threading.Thread(target=_load_thread, daemon=True).start()
+
+    def _on_offline_data_ready(self, success):
+        """Handle offline data loading completion."""
+        self._loading = False
+        self.progress.stop()
+        self.progress.pack_forget()
+        
+        if success:
+            now = datetime.now().strftime("%H:%M:%S")
+            self.status_var.set(f"✓ {len(self.data)} constituencies loaded from JSON  |  Loaded at: {now}")
+            
+            self._refresh_summary()
+            self._refresh_charts_tab()
+            self._refresh_stats_tab()
+            self._refresh_party_tab()
+            self.apply_filters()
+            self._refresh_close_tab()
+            self._refresh_notable_tab()
+            self._refresh_participants_tab()
+            
+            self._refresh_photo_status()
+            
+            # Disable auto-refresh in offline mode
+            self.auto_refresh.set(False)
+            
+            # Update offline status indicator
+            self.offline_status_lbl.config(text="📁 OFFLINE", fg="#059669")
+        else:
+            self.status_var.set("⚠ Could not load JSON data. Switching to live mode...")
+            self.offline_mode.set(False)
+            self.offline_toggle.deselect()
+            # Fall back to live mode
+            self.refresh_data()
+        
+        self._schedule_refresh()
 
     def _build_summary_tab(self):
         f = self.tab_summary
@@ -1938,6 +2218,7 @@ class TNElectionApp:
         self.progress.pack_forget()
         now = datetime.now().strftime("%H:%M:%S")
         self.status_var.set(f"✓ {len(data)} constituencies loaded  |  Last fetch: {now}")
+        
         self._refresh_summary()
         self._refresh_charts_tab()
         self._refresh_stats_tab()
@@ -1946,6 +2227,10 @@ class TNElectionApp:
         self._refresh_close_tab()
         self._refresh_notable_tab()
         self._load_participants()
+        
+        # Update offline status indicator
+        self.offline_status_lbl.config(text="🌐 LIVE", fg="#2563eb")
+        
         self._schedule_refresh()
 
     def _on_fetch_error(self, err):
@@ -1962,14 +2247,14 @@ class TNElectionApp:
         if self._countdown_job:
             self.root.after_cancel(self._countdown_job)
             self._countdown_job = None
-        if self.auto_refresh.get():
+        if self.auto_refresh.get() and not self.offline_mode.get():
             secs = self.refresh_interval.get()
             self._refresh_job = self.root.after(secs * 1000, self.refresh_data)
             self._countdown_remaining = secs
             self._tick_countdown()
 
     def _tick_countdown(self):
-        if not self.auto_refresh.get() or self._loading:
+        if not self.auto_refresh.get() or self._loading or self.offline_mode.get():
             return
         remaining = self._countdown_remaining
         base = self.status_var.get().split("  |  Next")[0]
